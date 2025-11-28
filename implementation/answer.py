@@ -88,7 +88,9 @@ def fetch_context(question: str) -> list[Document]:
     """
     Retrieve relevant documents using pure vector search (NO LLM call).
     """
-    return retriever.get_relevant_documents(question)
+    #return retriever.get_relevant_documents(question)
+    return retriever.invoke(question)
+
 
 
 # ---------------------------
