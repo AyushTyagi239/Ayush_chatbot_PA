@@ -1,8 +1,5 @@
 """
-Ayush Personal RAG – Answer Pipeline
-- Uses local ChromaDB
-- Local embeddings (SentenceTransformers)
-- NVIDIA NIM or Groq LLM for reranking + final answer
+Ayush Personal RAG – FAST Answer Pipeline
 """
 
 from dotenv import load_dotenv
@@ -12,157 +9,124 @@ from litellm import completion
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 from tenacity import retry, wait_exponential
+import json
 
-# ================================
-# ENV + CONFIG
-# ================================
+# ============================================
+# CONFIG
+# ============================================
 load_dotenv(override=True)
 
-MODEL = "nvidia_nim/meta/llama-3.1-8b-instruct"   # or your Groq model
-DB_NAME = str(Path(__file__).parent.parent / "preprocessed_db")
-collection_name = "ayush_docs"
+MODEL = "nvidia_nim/meta/llama-3.1-8b-instruct"
 
-RETRIEVAL_K = 15
+DB_NAME = str(Path(__file__).resolve().parent.parent / "preprocessed_db")
+collection_name = "docs"
+
+RETRIEVAL_K = 10
+RERANK_K = 5
 FINAL_K = 5
 
 wait = wait_exponential(multiplier=1, min=2, max=60)
 
-# Load local embedder
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
-# Load ChromaDB
 chroma = PersistentClient(path=DB_NAME)
 collection = chroma.get_or_create_collection(collection_name)
 
-# ================================
-# DATA MODELS
-# ================================
+# ============================================
+# MODEL OBJECTS
+# ============================================
 class Result(BaseModel):
     page_content: str
     metadata: dict
 
-
-# ================================
+# ============================================
 # RETRIEVAL
-# ================================
+# ============================================
 def fetch_context_unranked(question):
-    """Convert question → embedding → query Chroma → return top-K chunks."""
-    print("\n🔍 Generating embedding for user question...")
-    q_emb = embedder.encode([question], convert_to_numpy=True).tolist()[0]
+    print("\n🔍 Embedding question...")
+    q = embedder.encode([question], convert_to_numpy=True).tolist()[0]
 
-    results = collection.query(query_embeddings=[q_emb], n_results=RETRIEVAL_K)
+    results = collection.query(
+        query_embeddings=[q],
+        n_results=RETRIEVAL_K,
+        include=["documents", "metadatas"]
+    )
 
-    chunks = []
-    for doc, meta in zip(results["documents"][0], results["metadatas"][0]):
-        chunks.append(Result(page_content=doc, metadata=meta))
+    docs = results.get("documents", [[]])[0]
+    metas = results.get("metadatas", [[]])[0]
 
-    print(f"📚 Retrieved {len(chunks)} unranked chunks from Chroma.")
-    return chunks
+    out = [Result(page_content=d, metadata=m) for d, m in zip(docs, metas)]
+    print(f"📚 Retrieved {len(out)} chunks.")
+    return out
 
-
-# ================================
-# RERANKER (LLM)
-# ================================
+# ============================================
+# RERANKER
+# ============================================
 @retry(wait=wait)
 def rerank(question, chunks):
-    """Ask LLM to reorder chunks by relevance."""
-    print("\n🧠 Calling LLM to re-rank retrieved chunks...")
-
+    print("\n🧠 Reranking top chunks...")
     sys_prompt = """
-You are a chunk reranker.
-Return ONLY a JSON object: { "order": [1,2,3,...] }
-List all IDs from most relevant to least relevant.
-Do NOT add explanations.
+Return JSON only: {"order":[1,2,3,...]}
 """
 
     user_text = f"User Question:\n{question}\n\nChunks:\n"
-    for idx, c in enumerate(chunks):
-        user_text += f"\nCHUNK ID: {idx+1}\n{c.page_content}\n"
+    for i, ch in enumerate(chunks):
+        user_text += f"\nCHUNK {i+1}:\n{ch.page_content}\n"
 
     messages = [
         {"role": "system", "content": sys_prompt},
-        {"role": "user", "content": user_text},
+        {"role": "user", "content": user_text}
     ]
 
-    response = completion(model=MODEL, messages=messages)
-    raw = response.choices[0].message.content.strip()
+    resp = completion(model=MODEL, messages=messages)
+    raw = resp.choices[0].message.content
 
-    # Extract JSON safely
-    try:
-        import json
-        start = raw.find("{")
-        end = raw.rfind("}")
-        parsed = json.loads(raw[start:end+1])
-    except Exception:
-        print("\n❌ Failed to parse reranker output:\n", raw)
-        raise
+    start, end = raw.find("{"), raw.rfind("}")
+    order = json.loads(raw[start:end+1])["order"]
 
-    order = parsed["order"]
+    return [chunks[i-1] for i in order]
 
-    print(f"📊 Re-ranking complete. Order: {order}")
-    return [chunks[i - 1] for i in order]
-
-
-# ================================
+# ============================================
 # MESSAGE BUILDER
-# ================================
+# ============================================
 def make_rag_messages(question, chunks):
-    """Build system + user messages for final answer."""
-    context = "\n\n---\n\n".join(
+    ctx = "\n\n---\n\n".join(
         f"Source: {c.metadata['source']}\n{c.page_content}"
         for c in chunks
     )
 
-    SYSTEM_PROMPT = f"""
-You are a helpful assistant answering questions about Ayush Tyagi.
-Use ONLY the provided context.
-If the answer is not found, say: "I don't have that information."
+    sys_prompt = f"""
+You answer ONLY using the provided context.
+If info is missing, say: "I don't have that information."
 
 Context:
-{context}
+{ctx}
 """
 
     return [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": sys_prompt},
         {"role": "user", "content": question},
     ]
 
-
-# ================================
-# FINAL ANSWER
-# ================================
+# ============================================
+# ANSWER
+# ============================================
 @retry(wait=wait)
-def answer_question(question: str, history: list = []):
-    """
-    Full RAG flow:
-    1. Retrieve similar chunks
-    2. Re-rank them using LLM
-    3. Build a context window
-    4. Generate final answer
-    """
-    print("\n========================")
-    print("   ⚡ NEW RAG REQUEST")
-    print("========================")
-    print(f"❓ User Question: {question}")
+def answer_question(question: str, history=[]):
+    print("\n===============")
+    print("⚡ NEW REQUEST")
+    print("===============")
+    print("❓:", question)
 
-    # 1) Retrieve
     retrieved = fetch_context_unranked(question)
 
-    # 2) Rerank
-    reranked = rerank(question, retrieved)
+    reranked = rerank(question, retrieved[:RERANK_K])
 
-    # 3) Select top FINAL_K chunks
     final_chunks = reranked[:FINAL_K]
 
-    print(f"📌 Using top {len(final_chunks)} chunks for final answer.")
-
-    # 4) Prepare messages
     messages = make_rag_messages(question, final_chunks)
+    resp = completion(model=MODEL, messages=messages)
+    answer = resp.choices[0].message.content.strip()
 
-    # 5) Call LLM
-    print("🤖 Generating final answer...")
-    response = completion(model=MODEL, messages=messages)
-    answer = response.choices[0].message.content.strip()
-
-    print("\n✅ Answer generated successfully!")
+    print("\n✅ Done.")
     return answer, final_chunks
