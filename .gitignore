@@ -1,0 +1,17 @@
+# ------------------------------------------------------------------
+# CONFIGURATION / SECRETS
+# The .env file contains sensitive environment variables (API keys, etc.)
+.env
+
+# ------------------------------------------------------------------
+# DIRECTORY EXCLUSIONS
+# The trailing slash (/) ensures these rules only match directories.
+not_done/
+knowledge-base/
+checkscript/
+extras/
+vector_db
+knowledge-base/
+.ipynb_checkpoints
+db/
+community-contributions/
