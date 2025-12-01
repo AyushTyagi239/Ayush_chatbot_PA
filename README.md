@@ -6,16 +6,6 @@ This repository demonstrates an end-to-end RAG pipeline including chunking, embe
 
 ---
 
-## Overview
-
-This assistant uses a multi-stage pipeline to:
-
-- Load and preprocess knowledge  
-- Generate structured LLM-based chunks  
-- Store embeddings in a vector database  
-- Retrieve relevant context  
-- Rerank results  
-- Produce answers strictly grounded in the knowledge base  
 
 ### Key Goals
 
