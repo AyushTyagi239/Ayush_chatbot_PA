@@ -1,62 +1,136 @@
+# answer.py — RAG pipeline (NO GPT references)
+# Model-agnostic: set RAG_LLM_MODEL to your local / non-GPT model string
+# Works with litellm completion, Chroma, HuggingFace embeddings
+
 from pathlib import Path
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from dotenv import load_dotenv
+import os
+
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_core.messages import SystemMessage, HumanMessage, convert_to_messages
 from langchain_core.documents import Document
 
-from dotenv import load_dotenv
+from litellm import completion
 
-# decides how to answer by looking up the context 
 load_dotenv(override=True)
 
-MODEL = "gpt-4.1-nano"
-DB_NAME = str(Path(__file__).parent.parent / "vector_db")
+# ---------------------------
+# Config (no GPT names anywhere)
+# ---------------------------
+# Set this to any litellm-supported model string (local or hosted) that is NOT GPT.
+# Examples you might use (examples only — pick what your litellm supports):
+# - "mistral-7b" or "local-mistral" or "llama-2-13b" or a custom local path string
+MODEL = os.getenv("RAG_LLM_MODEL", "local-model")  # <- set this in your .env
 
-# embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-RETRIEVAL_K = 10
+HF_EMBED_MODEL = os.getenv("HF_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+DB_DIR = os.getenv("RAG_DB_DIR", "vector_db")
+COLLECTION_NAME = os.getenv("RAG_COLLECTION", "ayush_rag")
+RETRIEVAL_K = int(os.getenv("RETRIEVAL_K", "5"))
 
-SYSTEM_PROMPT = """
-You are a knowledgeable, friendly assistant representing the company Insurellm.
-You are chatting with a user about Insurellm.
-If relevant, use the given context to answer any question.
-If you don't know the answer, say so.
-Context:
-{context}
-"""
+# ---------------------------
+# Embeddings + Vectorstore
+# ---------------------------
+embedding_fn = HuggingFaceEmbeddings(model_name=HF_EMBED_MODEL)
 
-vectorstore = Chroma(persist_directory=DB_NAME, embedding_function=embeddings)
-retriever = vectorstore.as_retriever()
-llm = ChatOpenAI(temperature=0, model_name=MODEL)
+vectorstore = Chroma(
+    collection_name=COLLECTION_NAME,
+    persist_directory=DB_DIR,
+    embedding_function=embedding_fn,
+)
+
+retriever = vectorstore.as_retriever(search_kwargs={"k": RETRIEVAL_K})
 
 
+# ---------------------------
+# Retrieval helper
+# ---------------------------
 def fetch_context(question: str) -> list[Document]:
-    """
-    Retrieve relevant context documents for a question.
-    """
-    return retriever.get_relevant_documents(question)
+    docs = retriever.invoke(question)
+    if docs is None:
+        return []
+    if isinstance(docs, list):
+        return docs
+    return list(docs)
 
 
+# ---------------------------
+# Prompt builder (simple, safe)
+# ---------------------------
+def build_messages(question: str, context_text: str) -> list[dict]:
+    system_msg = {
+        "role": "system",
+        "content": (
+            "You are a RAG assistant. Use ONLY the provided context to answer. "
+            "If the context doesn't contain the answer, reply: 'Information not available in knowledge-base.' "
+            "Do not hallucinate."
+        ),
+    }
 
-def combined_question(question: str, history: list[dict] = []) -> str:
-    """
-    Combine all the user's messages into a single string.
-    """
-    prior = "\n".join(m["content"] for m in history if m["role"] == "user")
-    return prior + "\n" + question
+    user_msg = {
+        "role": "user",
+        "content": f"""Question:
+{question}
+
+Context:
+{context_text}
+
+Answer concisely and only using the above context."""
+    }
+
+    return [system_msg, user_msg]
 
 
-def answer_question(question: str, history: list[dict] = []) -> tuple[str, list[Document]]:
-    """
-    Answer the given question with RAG; return the answer and the context documents.
-    """
-    combined = combined_question(question, history)
-    docs = fetch_context(combined)
-    context = "\n\n".join(doc.page_content for doc in docs)
-    system_prompt = SYSTEM_PROMPT.format(context=context)
-    messages = [SystemMessage(content=system_prompt)]
-    messages.extend(convert_to_messages(history))
-    messages.append(HumanMessage(content=question))
-    response = llm.invoke(messages)
-    return response.content, docs
+# ---------------------------
+# RAG answer (model-agnostic)
+# ---------------------------
+def answer_question(question: str) -> tuple[str, list[Document]]:
+    # 1) Retrieve
+    docs = fetch_context(question)
+
+    # 2) Build context text
+    if docs:
+        chunks = []
+        for d in docs:
+            meta = d.metadata or {}
+            title = meta.get("title") or meta.get("source") or ""
+            header = f"[{title}]" if title else ""
+            chunks.append(f"{header}\n{d.page_content}")
+        context_text = "\n\n---\n\n".join(chunks)
+    else:
+        context_text = "No context available."
+
+    # 3) Build messages
+    messages = build_messages(question, context_text)
+
+    # 4) Call the model via litellm (provider/model chosen by env var)
+    resp = completion(model=MODEL, messages=messages)
+
+    # 5) Extract answer safely
+    answer_text = ""
+    try:
+        answer_text = resp.choices[0].message.content
+    except Exception:
+        try:
+            answer_text = resp.choices[0].text
+        except Exception:
+            answer_text = str(resp)
+
+    if not answer_text:
+        answer_text = "No answer generated."
+
+    return answer_text, docs
+
+
+# ---------------------------
+# CLI quick test
+# ---------------------------
+if __name__ == "__main__":
+    q = input("Enter question: ").strip()
+    ans, ctx = answer_question(q)
+    print("\n========== ANSWER ==========")
+    print(ans)
+    print("\n========== TOP CONTEXT DOCS ==========")
+    for i, d in enumerate(ctx, 1):
+        print(f"\n[{i}] meta={d.metadata}")
+        preview = (d.page_content[:400] + "...") if len(d.page_content) > 400 else d.page_content
+        print(preview)

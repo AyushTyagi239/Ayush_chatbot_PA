@@ -11,3 +11,7 @@ knowledge-base/
 checkscript/
 extras/
 vector_db
+knowledge-base/
+.ipynb_checkpoints
+db/
+community-contributions/
